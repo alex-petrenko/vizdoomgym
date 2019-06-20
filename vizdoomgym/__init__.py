@@ -134,3 +134,14 @@ register(
     id='VizdoomTexturedMazeRandomGoal-v2',
     entry_point='vizdoomgym.envs:VizdoomTexturedMazeRandomGoalV2'
 )
+
+
+register(
+    id='VizdoomBattle-v0',
+    entry_point='vizdoomgym.envs:VizdoomBattle'
+)
+
+register(
+    id='VizdoomBattle2-v0',
+    entry_point='vizdoomgym.envs:VizdoomBattle2'
+)

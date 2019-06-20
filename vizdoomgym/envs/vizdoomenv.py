@@ -1,5 +1,6 @@
 import logging
 import os
+import re
 from time import sleep
 
 import cv2
@@ -41,6 +42,9 @@ CONFIGS = [
     ['textured_maze_super_sparse_v2.cfg', 7],  # 24
     ['textured_maze_no_goal_random.cfg', 7],  # 25
     ['textured_maze_random_goal_v2.cfg', 7],  # 26
+
+    ['D3_battle.cfg', 9],  # 27
+    ['D4_battle2.cfg', 9],  # 28
 ]
 
 
@@ -72,6 +76,10 @@ class VizdoomEnv(gym.Env):
 
         self.action_space = spaces.Discrete(CONFIGS[self.level][1])
 
+        scenarios_dir = os.path.join(os.path.dirname(__file__), 'scenarios')
+        self.config_path = os.path.join(scenarios_dir, CONFIGS[self.level][0])
+        self.variable_indices = self._parse_variable_indices(self.config_path)
+
         self.viewer = None
 
         # Histogram to track positional coverage
@@ -92,7 +100,7 @@ class VizdoomEnv(gym.Env):
         self.seed()
 
     def calc_observation_space(self):
-        self.observation_space = spaces.Box(0, 255, (self.screen_w, self.screen_h, self.channels), dtype=np.uint8)
+        self.observation_space = spaces.Box(0, 255, (self.screen_h, self.screen_w, self.channels), dtype=np.uint8)
 
     def _ensure_initialized(self, mode='algo'):
         if self.initialized:
@@ -100,8 +108,8 @@ class VizdoomEnv(gym.Env):
             return
 
         self.game = DoomGame()
-        scenarios_dir = os.path.join(os.path.dirname(__file__), 'scenarios')
-        self.game.load_config(os.path.join(scenarios_dir, CONFIGS[self.level][0]))
+
+        self.game.load_config(self.config_path)
         self.game.set_screen_resolution(self.screen_resolution)
         # Setting an invalid level map will cause the game to freeze silently
         self.game.set_doom_map(self.level_map)
@@ -139,6 +147,29 @@ class VizdoomEnv(gym.Env):
 
         self.initialized = True
 
+    def _parse_variable_indices(self, config):
+        with open(config, 'r') as config_file:
+            lines = config_file.readlines()
+        lines = [l.strip() for l in lines]
+
+        variable_indices = {}
+
+        for line in lines:
+            if line.startswith('#'):
+                continue  # comment
+
+            variables_syntax = r'available_game_variables[\s]*=[\s]*\{(.*)\}'
+            match = re.match(variables_syntax, line)
+            if match is not None:
+                variables_str = match.groups()[0]
+                variables_str = variables_str.strip()
+                variables = variables_str.split(' ')
+                for i, variable in enumerate(variables):
+                    variable_indices[variable] = i
+                break
+
+        return variable_indices
+
     def _start_episode(self):
         # # TODO: Why set the seed here? Game is already initialized.
         # if self.curr_seed > 0:
@@ -151,6 +182,13 @@ class VizdoomEnv(gym.Env):
         self.curr_seed = seeding.hash_seed(seed, max_bytes=4)
         self.rng, _ = seeding.np_random(seed=self.curr_seed)
         return [self.curr_seed, self.rng]
+
+    def _game_variables_dict(self, state):
+        game_variables = state.game_variables
+        variables = {}
+        for variable, idx in self.variable_indices.items():
+            variables[variable] = game_variables[idx]
+        return variables
 
     def step(self, action):
         self._ensure_initialized()
@@ -167,7 +205,8 @@ class VizdoomEnv(gym.Env):
         done = self.game.is_episode_finished()
         if not done:
             observation = np.transpose(state.screen_buffer, (1, 2, 0))
-            info.update(self.get_info())
+            game_variables = self._game_variables_dict(state)
+            info.update(self.get_info(game_variables))
             self._update_histogram(info)
         else:
             observation = np.zeros(self.observation_space.shape, dtype=np.uint8)
@@ -193,7 +232,7 @@ class VizdoomEnv(gym.Env):
     def render(self, mode='human'):
         try:
             img = self.game.get_state().screen_buffer
-            img = np.transpose(img, [1, 2, 0])  # bgr to rgb
+            img = np.transpose(img, [1, 2, 0])
 
             h, w = img.shape[:2]
             render_w = 640
@@ -223,6 +262,7 @@ class VizdoomEnv(gym.Env):
 
                 if state is not None:
                     print('===============================')
+                    print('Info: ', self.get_info())
                     print('State: #' + str(state.number))
                     print('Action: \t' + str(self.game.get_last_action()) + '\t (=> only allowed actions)')
                     print('Reward: \t' + str(self.game.get_last_reward()))
@@ -243,24 +283,40 @@ class VizdoomEnv(gym.Env):
         print('===============================')
         print('Done')
 
-    def get_info(self):
-        return {'pos': self.get_positions()}
+    def get_info(self, variables=None):
+        if variables is None:
+            variables = self._game_variables_dict(self.game.get_state())
 
-    def get_info_all(self):
-        info = self.get_info()
+        info_dict = {'pos': self.get_positions(variables)}
+        info_dict.update(variables)
+        return info_dict
+
+    def get_info_all(self, variables=None):
+        if variables is None:
+            variables = self._game_variables_dict(self.game.get_state())
+        info = self.get_info(variables)
         if self.previous_histogram is not None:
             info['previous_histogram'] = self.previous_histogram
         return info
 
-    def get_positions(self):
-        return self._get_positions(self.game.get_state().game_variables)
+    def get_positions(self, variables):
+        return self._get_positions(variables)
 
     def _get_positions(self, variables):
-        coords = [np.nan] * 4
-        if len(variables) >= 4:
-            coords = variables
+        have_coord_data = True
+        required_vars = ['POSITION_X', 'POSITION_Y', 'ANGLE']
+        for required_var in required_vars:
+            if required_var not in variables:
+                have_coord_data = False
+                break
 
-        return {'agent_x': coords[1], 'agent_y': coords[2], 'agent_a': coords[3]}
+        x = y = a = np.nan
+        if have_coord_data:
+            x = variables['POSITION_X']
+            y = variables['POSITION_Y']
+            a = variables['ANGLE']
+
+        return {'agent_x': x, 'agent_y': y, 'agent_a': a}
 
     def get_automap_buffer(self):
         if self.game.is_episode_finished():
@@ -346,3 +402,14 @@ class VizdoomTexturedMazeSuperSparseV2(VizdoomEnv):
 class VizdoomTexturedMazeRandomGoalV2(VizdoomEnv):
     def __init__(self, **kwargs):
         super().__init__(26, coord_limits=(0, 0, 2336, 2368), **kwargs)
+
+
+class VizdoomBattle(VizdoomEnv):
+    def __init__(self, **kwargs):
+        super().__init__(27, coord_limits=(0, 0, 1856, 1856), **kwargs)
+
+
+class VizdoomBattle2(VizdoomEnv):
+    def __init__(self, **kwargs):
+        super().__init__(28, coord_limits=(0, 0, 1920, 1920), **kwargs)
+
